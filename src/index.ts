@@ -70,6 +70,10 @@ const MAX_BODY_BYTES = 32 * 1024 * 1024;
 const JWT_CACHE_KEY = "mimo-jwt";
 const JWT_REFRESH_BUFFER_MS = 5 * 60 * 1000;
 const JWT_CACHE_TTL_SECONDS = 60 * 60;
+// Upstream binds the JWT to the bootstrap egress IP. On hosts with a variable
+// egress IP (Cloudflare), retry by re-bootstrapping until the bootstrap and chat
+// egress IPs line up. ~40% match per attempt observed → 1 - 0.6^10 ≈ 99.4%.
+const MAX_AUTH_RETRIES = 10;
 
 const textEncoder = new TextEncoder();
 const textDecoder = new TextDecoder();
@@ -192,7 +196,7 @@ function handleModels(): Response {
 async function handleOpenAIChat(request: Request, env: Env, signal: AbortSignal): Promise<Response> {
   const bodyBytes = await readBody(request);
   const upstreamBody = ensureOpenAIMarker(bodyBytes);
-  const upstream = await fetchUpstream(env, upstreamBody, signal);
+  const upstream = await fetchUpstreamResilient(env, upstreamBody, signal);
   const headers = cloneResponseHeaders(upstream.headers);
   headers.set("Cache-Control", "no-cache");
   applyCors(headers);
@@ -215,7 +219,7 @@ async function handleAnthropicMessages(request: Request, env: Env, signal: Abort
 
   const openAIRequest = anthropicToOpenAI(anthropicRequest);
   const openAIBody = textEncoder.encode(JSON.stringify(openAIRequest));
-  const upstream = await fetchUpstream(env, openAIBody, signal);
+  const upstream = await fetchUpstreamResilient(env, openAIBody, signal);
 
   if (anthropicRequest.stream) {
     if (upstream.status >= 400) {
@@ -273,8 +277,12 @@ function buildUpstreamUrl(env: Env, pathname: string): string {
   return `${base}${pathname}`;
 }
 
-async function fetchUpstream(env: Env, body: Uint8Array, signal: AbortSignal): Promise<Response> {
-  const jwt = await getJwt(env);
+async function fetchUpstream(env: Env, body: Uint8Array, signal: AbortSignal, fresh = false): Promise<Response> {
+  // fresh=true bootstraps a brand-new token bypassing all caching. Used by the
+  // IP-retry loop: upstream binds the token to the bootstrap egress IP, and on
+  // Cloudflare the bootstrap/chat fetches use varying egress IPs, so a fresh
+  // token gives another independent chance for the two IPs to line up.
+  const jwt = fresh ? (await bootstrapJwt(env)).jwt : await getJwt(env);
   const headers = new Headers({
     "Content-Type": "application/json",
     Authorization: `Bearer ${jwt}`,
@@ -289,6 +297,21 @@ async function fetchUpstream(env: Env, body: Uint8Array, signal: AbortSignal): P
     body: new Blob([body.buffer.slice(body.byteOffset, body.byteOffset + body.byteLength) as ArrayBuffer]),
     signal,
   });
+}
+
+// fetchUpstreamResilient works around upstream's IP-bound tokens on hosts with a
+// variable egress IP (Cloudflare). First it tries the shared/cached token (which
+// is optimal on a fixed-IP host — one bootstrap, reused). If upstream rejects it
+// with 401 (token's bootstrap IP != this request's chat egress IP), it re-
+// bootstraps a fresh token and retries, up to MAX_AUTH_RETRIES times. Safe
+// because upstream has no bootstrap rate limit (verified empirically).
+async function fetchUpstreamResilient(env: Env, body: Uint8Array, signal: AbortSignal): Promise<Response> {
+  let response = await fetchUpstream(env, body, signal);
+  for (let attempt = 0; attempt < MAX_AUTH_RETRIES && response.status === 401; attempt += 1) {
+    await response.body?.cancel().catch(() => undefined);
+    response = await fetchUpstream(env, body, signal, true);
+  }
+  return response;
 }
 
 // getJwt returns a shared JWT, mirroring the Go server's single-token model:
