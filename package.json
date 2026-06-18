@@ -1,0 +1,16 @@
+{
+  "name": "mimo-proxy-cf-worker",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "typecheck": "tsc --noEmit",
+    "deploy": "wrangler deploy"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.202605.0",
+    "typescript": "^5.8.3",
+    "wrangler": "^4.18.0"
+  }
+}
