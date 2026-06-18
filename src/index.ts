@@ -191,7 +191,7 @@ function handleModels(): Response {
 async function handleOpenAIChat(request: Request, env: Env, signal: AbortSignal): Promise<Response> {
   const bodyBytes = await readBody(request);
   const upstreamBody = ensureOpenAIMarker(bodyBytes);
-  const upstream = await fetchUpstream(env, upstreamBody, signal);
+  const upstream = await fetchUpstreamWithRetry(env, upstreamBody, signal);
   const headers = cloneResponseHeaders(upstream.headers);
   headers.set("Cache-Control", "no-cache");
   applyCors(headers);
@@ -214,7 +214,7 @@ async function handleAnthropicMessages(request: Request, env: Env, signal: Abort
 
   const openAIRequest = anthropicToOpenAI(anthropicRequest);
   const openAIBody = textEncoder.encode(JSON.stringify(openAIRequest));
-  const upstream = await fetchUpstream(env, openAIBody, signal);
+  const upstream = await fetchUpstreamWithRetry(env, openAIBody, signal);
 
   if (anthropicRequest.stream) {
     if (upstream.status >= 400) {
@@ -272,8 +272,8 @@ function buildUpstreamUrl(env: Env, pathname: string): string {
   return `${base}${pathname}`;
 }
 
-async function fetchUpstream(env: Env, body: Uint8Array, signal: AbortSignal): Promise<Response> {
-  const jwt = await getJwt(env);
+async function fetchUpstream(env: Env, body: Uint8Array, signal: AbortSignal, forceRefresh = false): Promise<Response> {
+  const jwt = await getJwt(env, forceRefresh);
   const headers = new Headers({
     "Content-Type": "application/json",
     Authorization: `Bearer ${jwt}`,
@@ -290,9 +290,28 @@ async function fetchUpstream(env: Env, body: Uint8Array, signal: AbortSignal): P
   });
 }
 
-async function getJwt(env: Env): Promise<string> {
-  const cached = await readCachedJwt(env);
-  if (cached) return cached.jwt;
+// fetchUpstreamWithRetry self-heals a stale/invalid cached JWT: if upstream
+// rejects auth (401/403), it drops the cached token, re-bootstraps a fresh one,
+// and retries the request exactly once.
+async function fetchUpstreamWithRetry(env: Env, body: Uint8Array, signal: AbortSignal): Promise<Response> {
+  const response = await fetchUpstream(env, body, signal);
+  if (response.status !== 401 && response.status !== 403) {
+    return response;
+  }
+  await response.body?.cancel().catch(() => undefined);
+  return fetchUpstream(env, body, signal, true);
+}
+
+async function getJwt(env: Env, forceRefresh = false): Promise<string> {
+  if (forceRefresh) {
+    // Drop any cached JWT (in-memory + KV) so the bootstrap below is forced.
+    jwtCache.delete(JWT_CACHE_KEY);
+    const kv = env.MIMO_JWT_KV;
+    if (kv) await kv.delete(JWT_CACHE_KEY).catch(() => undefined);
+  } else {
+    const cached = await readCachedJwt(env);
+    if (cached) return cached.jwt;
+  }
 
   const entry = await bootstrapJwt(env);
   jwtCache.set(JWT_CACHE_KEY, entry);
