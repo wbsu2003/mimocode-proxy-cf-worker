@@ -1,0 +1,26 @@
+name: Deploy
+
+# 推送到 main 时自动部署到 Cloudflare Workers。
+# 需要在 GitHub 仓库 Settings -> Secrets and variables -> Actions 配置：
+#   - CLOUDFLARE_API_TOKEN  （Cloudflare 后台创建，需 "Edit Cloudflare Workers" 权限）
+#   - CLOUDFLARE_ACCOUNT_ID （Cloudflare 后台右侧栏的 Account ID）
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci
+      - run: npm run typecheck
+      - uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
