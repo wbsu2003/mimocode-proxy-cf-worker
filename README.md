@@ -28,7 +28,7 @@ Cloudflare Worker 版本的 mimo-proxy，行为对齐 Go 版 `mimo-proxy`。
   - `User-Agent: mimocode/1.0.0`
 - 缺失 system marker 时自动补入：`You are MiMoCode, an interactive CLI tool that helps users with software engineering tasks.`
 
-## 部署
+## 手动部署 (Wrangler CLI)
 
 1. 安装依赖：
 
@@ -67,6 +67,49 @@ wrangler secret put MIMO_CLIENT_FINGERPRINT
 ```bash
 npm run deploy
 ```
+
+## 通过 GitHub 部署
+
+无论哪种方式，**前置准备都一样**：先按「手动部署」第 2 步建好真实 KV namespace 并填进 `wrangler.toml`，再用 `wrangler secret put` 设置好 `MIMO_API_KEY` / `MIMO_CLIENT_FINGERPRINT` 等密钥（这些存在 Cloudflare 侧，不进 GitHub）。
+
+仓库已内置两个 workflow：
+
+- `.github/workflows/ci.yml`：push / PR 时跑 `tsc --noEmit` 类型检查。
+- `.github/workflows/deploy.yml`：push 到 `main`（或手动触发）时部署到 Cloudflare Workers。
+
+### 方式一：Cloudflare 原生 Git 集成（Workers Builds，推荐）
+
+GitHub 侧零密钥，由 Cloudflare 监听仓库：
+
+1. Cloudflare 后台 → **Workers & Pages** → **Create** → **Connect to Git**。
+2. 授权 GitHub，选择本仓库。
+3. 构建配置：Build command `npm ci`，Deploy command `npx wrangler deploy`，分支 `main`。
+4. 保存。之后每次 `git push` 到 `main`，Cloudflare 自动构建并部署。
+
+> 用方式一时不需要 `deploy.yml`，建议删除它（只保留 `ci.yml`），避免与 Cloudflare 的自动部署重复触发。
+
+### 方式二：GitHub Actions 主动部署（使用内置 `deploy.yml`）
+
+部署前可先跑类型检查作为门禁，控制权在 GitHub 侧。需配置两个仓库 secret：
+
+1. **创建 API Token**：Cloudflare 后台 → My Profile → API Tokens → Create Token → 套用 **"Edit Cloudflare Workers"** 模板。
+2. **获取 Account ID**：Workers & Pages 页面右侧栏。
+3. GitHub repo → **Settings → Secrets and variables → Actions** 添加：
+   - `CLOUDFLARE_API_TOKEN`
+   - `CLOUDFLARE_ACCOUNT_ID`
+
+配好后 push 到 `main` 即触发部署，也可在 Actions 页面手动 **Run workflow**。
+
+> ⚠️ 不要同时启用方式一和方式二的部署，否则一次 push 会触发两次部署、互相覆盖并浪费构建额度。`ci.yml` 只做检查不部署，可与任一方式共存。
+
+| | 方式一 Workers Builds | 方式二 GitHub Actions |
+|---|---|---|
+| GitHub 配 secret | 不需要 | 需要 2 个 |
+| 部署前自定义 CI | 受限 | 完全自由 |
+| 触发 | push 自动 | push 自动 + 手动 |
+| 维护成本 | 最低 | 中 |
+
+部署完成后用 `/health` 和一次真实 chat 请求验证（类型检查挡不住「KV id 仍是占位符」这类配置问题）。
 
 ## 本地开发
 
