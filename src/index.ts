@@ -1,3 +1,45 @@
+/**
+ * mimo-proxy-cf-worker — Cloudflare Worker 版的 mimo-proxy（对齐 Go 版行为）。
+ * 把 OpenAI / Anthropic 协议代理到小米 `api.xiaomimimo.com` 的免费 mimo-auto。
+ *
+ * ───────────────────────────────────────────────────────────────────────────
+ * 踩坑记录与设计依据（务必读，否则很容易"改对成改错"）
+ * ───────────────────────────────────────────────────────────────────────────
+ *
+ * 【头号坑】上游把 bootstrap 返回的 JWT 绑定到 *bootstrap 请求的来源 IP*。
+ *   token 只能从"签发它的那个 IP"发起 chat，换 IP → `401 invalid_token`。
+ *   实证：让 Worker(CF 出口 IP) bootstrap 出 token，拿到另一台机器用 → 401；
+ *   本机自己 bootstrap 的 token 本机用 → 200。
+ *
+ *   影响：Cloudflare Workers 没有固定出口 IP——bootstrap 与 chat 是两个独立
+ *   `fetch`，会从不同 CF 出口 IP（甚至不同数据中心）发出。因此：
+ *     - "缓存一个 token 全局复用"在 CF 上几乎必然失败（chat 的 IP 对不上
+ *       bootstrap 的 IP）。KV 全球共享会把"偶尔撞中"变成"一致失败"，是帮倒忙。
+ *     - 单机单 IP 部署（Go 版 / VPS / NAS）天然没这个问题，首个 token 当场可用、
+ *       可缓存复用。
+ *
+ * 【解法】见 `fetchUpstreamResilient`：先用（可能缓存的）共享 token 试一次；
+ *   若 401，就重新 bootstrap 一个全新 token 再试，最多 MAX_AUTH_RETRIES 次，
+ *   直到某次 bootstrap 与 chat 的出口 IP 恰好一致。单次撞中率约 40%，10 次 ≈ 99%。
+ *   之所以敢这样"暴力重试"，是因为实测上游 *没有 bootstrap 频率限制*（见下）。
+ *   代价：CF 上每请求要试几次，延迟约 3~11s。固定 IP 主机上第一次就中，循环空转。
+ *
+ * 【两个被证伪的假设（曾据此走过弯路，勿重蹈）】
+ *   1. `403 Illegal access` 不是"封 IP/防滥用"，而是 *请求缺少 anti-abuse 系统
+ *      marker*（ANTI_ABUSE_MARKER）。本代理会自动注入，所以正常只会遇到 401 而非
+ *      403；手动直连上游测试时若漏了 marker 就会 403，别误读成被封。
+ *   2. 上游 *不* 按 `client` 指纹做频率防滥用，指纹也不影响 token 能否 chat
+ *      （随机指纹照常工作）。同一 IP 快速连做多次 bootstrap+chat 全部成功 →
+ *      无频率限制。因此 *无需也不建议设置 MIMO_CLIENT_FINGERPRINT*，随机即可。
+ *
+ * 【排查方法论】`/health` 不连上游、永远 200，用来测连通；要区分"代理 bug"还是
+ *   "上游行为"，就直连上游、用与代理 *逐字节一致* 的请求（含 marker 与全部头）复刻；
+ *   错误体是上游格式(`invalid_token`/`illegal_access`)还是代理格式
+ *   (`authentication_error`) 能判断卡在哪一层。
+ *
+ * 【部署要点】`wrangler deploy` 会用 wrangler.toml 覆盖明文 vars，后台手填的明文
+ *   变量会被清空 → 敏感值（MIMO_API_KEY）必须用 `wrangler secret put`（跨部署保留）。
+ */
 import type { KVNamespace } from "@cloudflare/workers-types";
 
 interface Env {
@@ -5,6 +47,10 @@ interface Env {
   MIMO_API_KEY?: string;
   API_KEY?: string;
   MIMO_JWT_KV?: KVNamespace;
+  /**
+   * 客户端指纹。不建议设置——上游不按指纹限流，固定值也无收益（见文件头）。
+   * 未设置时每个 isolate 启动随机生成一个并在其生命周期内保持。
+   */
   MIMO_CLIENT_FINGERPRINT?: string;
 }
 
@@ -314,11 +360,11 @@ async function fetchUpstreamResilient(env: Env, body: Uint8Array, signal: AbortS
   return response;
 }
 
-// getJwt returns a shared JWT, mirroring the Go server's single-token model:
-// read the cached token (in-memory, then KV), and only bootstrap when it is
-// missing or within JWT_REFRESH_BUFFER_MS of expiry. It never bootstraps in
-// reaction to an upstream 401 — proactive refresh keeps the token valid, and
-// reactive re-bootstrapping would storm upstream anti-abuse.
+// getJwt returns the shared/cached JWT (in-memory, then KV), bootstrapping only
+// when it is missing. This is the "happy path" token, optimal on a fixed-IP host
+// where one bootstrap is reused. Reactive re-bootstrapping on 401 is intentionally
+// NOT done here — that is `fetchUpstreamResilient`'s job (it bypasses this cache
+// and mints fresh per-attempt tokens to chase an IP match; see file header).
 async function getJwt(env: Env): Promise<string> {
   const cached = await readCachedJwt(env);
   if (cached) return cached.jwt;
