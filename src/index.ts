@@ -97,13 +97,6 @@ export default {
 
     try {
       switch (path) {
-        case "/debug/jwt": {
-          // TEMPORARY diagnostic: bootstrap a token from the Worker (CF egress IP)
-          // and return it so it can be tested from another IP (IP-binding check).
-          const entry = await bootstrapJwt(env);
-          const colo = (request as unknown as { cf?: { colo?: string } }).cf?.colo ?? "unknown";
-          return jsonResponse({ jwt: entry.jwt, exp: entry.exp, colo });
-        }
         case "/v1/models":
         case "/models":
           if (request.method !== "GET") return methodNotAllowed(["GET"]);
@@ -304,12 +297,26 @@ async function fetchUpstream(env: Env, body: Uint8Array, signal: AbortSignal): P
 // reaction to an upstream 401 — proactive refresh keeps the token valid, and
 // reactive re-bootstrapping would storm upstream anti-abuse.
 async function getJwt(env: Env): Promise<string> {
-  // EXPERIMENT (temporary): always bootstrap fresh in the same invocation as the
-  // chat call, bypassing all caching. Tests whether upstream binds the token to
-  // the bootstrap source IP — if so, bootstrap+chat back-to-back (same egress)
-  // should succeed, while a cross-colo KV-shared token does not.
-  const fresh = await bootstrapJwt(env);
-  return fresh.jwt;
+  const cached = await readCachedJwt(env);
+  if (cached) return cached.jwt;
+
+  // Single-flight: collapse concurrent bootstraps within this isolate into one
+  // upstream call. Mirrors the Go server's jwtMu mutex.
+  if (!bootstrapInFlight) {
+    bootstrapInFlight = (async () => {
+      try {
+        const fresh = await bootstrapJwt(env);
+        jwtCache.set(JWT_CACHE_KEY, fresh);
+        await writeCachedJwt(env, fresh).catch(() => undefined);
+        return fresh;
+      } finally {
+        bootstrapInFlight = null;
+      }
+    })();
+  }
+
+  const entry = await bootstrapInFlight;
+  return entry.jwt;
 }
 
 async function readCachedJwt(env: Env): Promise<JwtEntry | null> {

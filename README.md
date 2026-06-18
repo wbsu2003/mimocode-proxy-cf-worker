@@ -2,6 +2,20 @@
 
 Cloudflare Worker 版本的 mimo-proxy，行为对齐 Go 版 `mimo-proxy`。
 
+> ## 🚨 重要：本上游与 Cloudflare Workers 架构性不兼容
+>
+> 经实测确认：**上游 `api.xiaomimimo.com` 会把 bootstrap 返回的 JWT 绑定到 bootstrap 请求的来源 IP**——该 token 只能从签发它的那个 IP 发起 chat，换 IP 即 `401 invalid_token`。
+>
+> Cloudflare Workers **没有固定出口 IP**：bootstrap 与 chat 是两个独立 `fetch`，会从不同的 CF 出口 IP（甚至不同数据中心）发出；KV 又是全球共享，一个 token 会被多机房复用。结果是 chat 的来源 IP 几乎永远对不上 bootstrap 的 IP，请求**间歇性/持续性 401**。
+>
+> **这不是本仓库代码的 bug，无法在 Worker 内修复**（免费版无法固定出口 IP；企业版需 Egress/Regional Services 专用出口）。
+>
+> **请改用固定出口 IP 的部署**：
+> - 直接用原版 Go `mimo-proxy` 跑在 VPS / 家庭服务器上（它本就为此设计）。
+> - 或把本 TS 适配到 Node/Bun/Deno，跑在有稳定出口 IP 的主机（VPS、Fly.io 专用 IP 等）。
+>
+> 验证方法：`curl https://<你的域名>/health` 永远 200（不连上游）；但真实 chat 请求会间歇 401。本仓库代码逻辑（协议转换、流式、鉴权、缓存）本身是正确的，换到单 IP 主机即可正常工作。
+
 ## 功能
 
 - `/health` 健康检查，不需要 API Key。
