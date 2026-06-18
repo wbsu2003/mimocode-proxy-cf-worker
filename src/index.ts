@@ -97,6 +97,13 @@ export default {
 
     try {
       switch (path) {
+        case "/debug/jwt": {
+          // TEMPORARY diagnostic: bootstrap a token from the Worker (CF egress IP)
+          // and return it so it can be tested from another IP (IP-binding check).
+          const entry = await bootstrapJwt(env);
+          const colo = (request as unknown as { cf?: { colo?: string } }).cf?.colo ?? "unknown";
+          return jsonResponse({ jwt: entry.jwt, exp: entry.exp, colo });
+        }
         case "/v1/models":
         case "/models":
           if (request.method !== "GET") return methodNotAllowed(["GET"]);
