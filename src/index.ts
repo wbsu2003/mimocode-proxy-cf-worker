@@ -116,9 +116,9 @@ const MAX_BODY_BYTES = 32 * 1024 * 1024;
 const JWT_CACHE_KEY = "mimo-jwt";
 const JWT_REFRESH_BUFFER_MS = 5 * 60 * 1000;
 const JWT_CACHE_TTL_SECONDS = 60 * 60;
-// Upstream binds the JWT to the bootstrap egress IP. On hosts with a variable
-// egress IP (Cloudflare), retry by re-bootstrapping until the bootstrap and chat
-// egress IPs line up. ~40% match per attempt observed → 1 - 0.6^10 ≈ 99.4%.
+// 上游把 JWT 绑定到 bootstrap 的出口 IP。在出口 IP 不固定的宿主上（Cloudflare），
+// 靠反复重新 bootstrap，直到 bootstrap 与 chat 的出口 IP 撞上来重试。
+// 实测单次撞中率约 40% → 1 - 0.6^10 ≈ 99.4%。
 const MAX_AUTH_RETRIES = 10;
 
 const textEncoder = new TextEncoder();
@@ -324,10 +324,9 @@ function buildUpstreamUrl(env: Env, pathname: string): string {
 }
 
 async function fetchUpstream(env: Env, body: Uint8Array, signal: AbortSignal, fresh = false): Promise<Response> {
-  // fresh=true bootstraps a brand-new token bypassing all caching. Used by the
-  // IP-retry loop: upstream binds the token to the bootstrap egress IP, and on
-  // Cloudflare the bootstrap/chat fetches use varying egress IPs, so a fresh
-  // token gives another independent chance for the two IPs to line up.
+  // fresh=true 时绕过所有缓存、bootstrap 一个全新 token。供 IP 重试循环使用：
+  // 上游把 token 绑定到 bootstrap 的出口 IP，而 Cloudflare 上 bootstrap 与 chat 这两个
+  // fetch 的出口 IP 各不相同，所以每个全新 token 都给"两个 IP 撞上"多一次独立机会。
   const jwt = fresh ? (await bootstrapJwt(env)).jwt : await getJwt(env);
   const headers = new Headers({
     "Content-Type": "application/json",
@@ -345,12 +344,11 @@ async function fetchUpstream(env: Env, body: Uint8Array, signal: AbortSignal, fr
   });
 }
 
-// fetchUpstreamResilient works around upstream's IP-bound tokens on hosts with a
-// variable egress IP (Cloudflare). First it tries the shared/cached token (which
-// is optimal on a fixed-IP host — one bootstrap, reused). If upstream rejects it
-// with 401 (token's bootstrap IP != this request's chat egress IP), it re-
-// bootstraps a fresh token and retries, up to MAX_AUTH_RETRIES times. Safe
-// because upstream has no bootstrap rate limit (verified empirically).
+// fetchUpstreamResilient 用于在出口 IP 不固定的宿主（Cloudflare）上绕过上游"token 绑定
+// IP"的限制。先用共享/缓存的 token 试一次（在固定 IP 宿主上这是最优：只 bootstrap 一次、
+// 反复复用）。若上游返回 401（token 的 bootstrap IP ≠ 本次请求 chat 的出口 IP），就重新
+// bootstrap 一个全新 token 重试，最多 MAX_AUTH_RETRIES 次。之所以安全，是因为实测上游
+// 没有 bootstrap 频率限制。
 async function fetchUpstreamResilient(env: Env, body: Uint8Array, signal: AbortSignal): Promise<Response> {
   let response = await fetchUpstream(env, body, signal);
   for (let attempt = 0; attempt < MAX_AUTH_RETRIES && response.status === 401; attempt += 1) {
@@ -360,17 +358,15 @@ async function fetchUpstreamResilient(env: Env, body: Uint8Array, signal: AbortS
   return response;
 }
 
-// getJwt returns the shared/cached JWT (in-memory, then KV), bootstrapping only
-// when it is missing. This is the "happy path" token, optimal on a fixed-IP host
-// where one bootstrap is reused. Reactive re-bootstrapping on 401 is intentionally
-// NOT done here — that is `fetchUpstreamResilient`'s job (it bypasses this cache
-// and mints fresh per-attempt tokens to chase an IP match; see file header).
+// getJwt 返回共享/缓存的 JWT（先内存，后 KV），仅在缺失时才 bootstrap。这是"顺利路径"的
+// token，在固定 IP 宿主上最优（一次 bootstrap 反复复用）。这里刻意不做"401 时反应式重新
+// bootstrap"——那是 `fetchUpstreamResilient` 的职责（它绕过本缓存、每次重试都铸造全新
+// token 去撞 IP；详见文件头）。
 async function getJwt(env: Env): Promise<string> {
   const cached = await readCachedJwt(env);
   if (cached) return cached.jwt;
 
-  // Single-flight: collapse concurrent bootstraps within this isolate into one
-  // upstream call. Mirrors the Go server's jwtMu mutex.
+  // 单飞：把同一 isolate 内并发的 bootstrap 合并成一次上游调用，对应 Go 版的 jwtMu 互斥锁。
   if (!bootstrapInFlight) {
     bootstrapInFlight = (async () => {
       try {
@@ -466,7 +462,7 @@ function parseJwtExp(jwt: string): number {
     const payload = JSON.parse(textDecoder.decode(bytes)) as { exp?: number };
     if (payload.exp && payload.exp > 0) return payload.exp * 1000;
   } catch {
-    // Fall through to default TTL.
+    // 解析失败，落到下面的默认 TTL。
   }
 
   return Date.now() + 50 * 60 * 1000;
@@ -706,8 +702,8 @@ class AnthropicStreamTransformer {
       this.handleLine(this.buffer, controller);
     }
     if (!this.stopped) {
-      // Upstream may close without a [DONE]/finish_reason. Mirror the [DONE]
-      // path so the client always receives a well-formed event sequence.
+      // 上游可能不发 [DONE]/finish_reason 就直接关闭连接。这里复用 [DONE] 的处理路径，
+      // 确保客户端始终收到结构完整的事件序列。
       this.handleDone(controller);
     }
   }
@@ -929,7 +925,7 @@ function extractUpstreamErrorMessage(body: string): string {
     const parsed = JSON.parse(body) as { error?: { message?: string } };
     if (parsed.error?.message) return parsed.error.message;
   } catch {
-    // Fall through.
+    // 解析失败，继续往下走。
   }
   return body || "[upstream response parse error]";
 }
