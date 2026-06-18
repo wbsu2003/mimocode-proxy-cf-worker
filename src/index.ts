@@ -74,6 +74,7 @@ const JWT_CACHE_TTL_SECONDS = 60 * 60;
 const textEncoder = new TextEncoder();
 const textDecoder = new TextDecoder();
 const jwtCache = new Map<string, JwtEntry>();
+let bootstrapInFlight: Promise<JwtEntry> | null = null;
 let fingerprintValue: string | undefined;
 
 export default {
@@ -316,9 +317,25 @@ async function getJwt(env: Env, forceRefresh = false): Promise<string> {
     if (cached) return cached.jwt;
   }
 
-  const entry = await bootstrapJwt(env);
-  jwtCache.set(JWT_CACHE_KEY, entry);
-  await writeCachedJwt(env, entry).catch(() => undefined);
+  // Single-flight: collapse concurrent bootstraps within this isolate into one
+  // upstream call. Without this, a burst of requests hitting a cold isolate
+  // would each bootstrap with the same client fingerprint at once, which trips
+  // upstream anti-abuse (it rejects tokens when one fingerprint bootstraps too
+  // often). Mirrors the Go server's jwtMu mutex.
+  if (!bootstrapInFlight) {
+    bootstrapInFlight = (async () => {
+      try {
+        const fresh = await bootstrapJwt(env);
+        jwtCache.set(JWT_CACHE_KEY, fresh);
+        await writeCachedJwt(env, fresh).catch(() => undefined);
+        return fresh;
+      } finally {
+        bootstrapInFlight = null;
+      }
+    })();
+  }
+
+  const entry = await bootstrapInFlight;
   return entry.jwt;
 }
 
