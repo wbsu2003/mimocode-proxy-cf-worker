@@ -74,19 +74,13 @@ wrangler secret put MIMO_BASE_URL
 npm run deploy
 ```
 
-## ⚠️ 指纹与防滥用（重要）
+## 关于错误码与指纹（澄清）
 
-**不要设置 `MIMO_CLIENT_FINGERPRINT`。** 上游按 `client` 指纹做防滥用：同一个指纹被频繁 bootstrap 会被判定为滥用，导致该指纹签发的 token 被作废（返回 `401 invalid_token` / `403 illegal_access`）。
+- **`401 invalid_token`**：JWT 与当前 chat 请求的来源 IP 不匹配。根因见顶部「IP 绑定」警告——这是 CF Workers 上的主要失败原因。
+- **`403 illegal_access`**：请求**缺少 anti-abuse 系统 marker**（`You are MiMoCode...`）。本代理会自动注入该 marker，所以正常不会出现；手动直连上游测试时若漏掉 marker 就会 403。**它与请求频率、指纹无关。**
+- **客户端指纹**：经实测，上游**不**按指纹做频率防滥用，指纹也**不**影响 token 能否用于 chat（随机指纹照常工作）。因此**无需也不建议设置 `MIMO_CLIENT_FINGERPRINT`**，让每个实例用随机指纹即可。指纹不是失败原因——失败原因是上面的 IP 绑定。
 
-Go 原版是单进程、单指纹、单 token、后台慢刷新，所以从不触发。但 Cloudflare Worker 是**多 isolate**的：如果设了固定指纹，所有 isolate 都用同一个指纹各自 bootstrap，从 Cloudflare 共享出口 IP 看就像一个客户端在刷接口 → 触发防滥用 → 间歇性 401/403。
-
-正确做法：
-
-- **不设 `MIMO_CLIENT_FINGERPRINT`** → 每个 isolate 用自己随机生成、且生命周期内稳定的指纹，彼此独立、互不作废。
-- **让 KV 缓存真正生效**(见第 2 步)→ 各 isolate 共享同一个 token，bootstrap 频率降到最低。
-- 代码侧已有两道保护:同 isolate 内并发 bootstrap 用单飞合并;上游返回 401 时丢弃缓存、刷新并重试一次(403 不重试,以免加剧防滥用)。
-
-排查时若看到间歇性 `Invalid Token`,且 KV namespace 显示「无读写」,基本就是这个问题:先删掉 `MIMO_CLIENT_FINGERPRINT`,再修好 KV 绑定。
+> 注：曾一度怀疑"同指纹频繁 bootstrap 触发防滥用"，后经隔离实验证伪（同一 IP 快速多次 bootstrap+chat 全部成功）。真正的根因是 token 绑定来源 IP，见顶部警告。
 
 ## 通过 GitHub 部署
 
