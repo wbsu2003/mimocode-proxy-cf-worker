@@ -2,19 +2,21 @@
 
 Cloudflare Worker 版本的 mimo-proxy，行为对齐 Go 版 `mimo-proxy`。
 
-> ## 🚨 重要：本上游与 Cloudflare Workers 架构性不兼容
+> ## ⚠️ 重要：上游 token 绑定来源 IP（CF 上可用但有延迟代价）
 >
 > 经实测确认：**上游 `api.xiaomimimo.com` 会把 bootstrap 返回的 JWT 绑定到 bootstrap 请求的来源 IP**——该 token 只能从签发它的那个 IP 发起 chat，换 IP 即 `401 invalid_token`。
 >
-> Cloudflare Workers **没有固定出口 IP**：bootstrap 与 chat 是两个独立 `fetch`，会从不同的 CF 出口 IP（甚至不同数据中心）发出；KV 又是全球共享，一个 token 会被多机房复用。结果是 chat 的来源 IP 几乎永远对不上 bootstrap 的 IP，请求**间歇性/持续性 401**。
+> Cloudflare Workers **没有固定出口 IP**：bootstrap 与 chat 是两个独立 `fetch`，会从不同的 CF 出口 IP（甚至不同数据中心）发出。所以"缓存一个 token 复用"在 CF 上几乎必然失败（chat 的 IP 对不上 bootstrap 的 IP）。
 >
-> **这不是本仓库代码的 bug，无法在 Worker 内修复**（免费版无法固定出口 IP；企业版需 Egress/Regional Services 专用出口）。
+> **本代理的应对**：由于实测上游**没有 bootstrap 频率限制**，代码用「重试直到 IP 撞上」绕过——一次请求里若 chat 返回 401，就重新 bootstrap 一个新 token 再试，最多 `MAX_AUTH_RETRIES`(默认 10) 次。单次撞中率约 40%，10 次后成功率 ≈ 99%。**实测 CF 上 8/8 成功。**
 >
-> **请改用固定出口 IP 的部署**：
-> - 直接用原版 Go `mimo-proxy` 跑在 VPS / 家庭服务器上（它本就为此设计）。
-> - 或把本 TS 适配到 Node/Bun/Deno，跑在有稳定出口 IP 的主机（VPS、Fly.io 专用 IP 等）。
+> **代价：延迟**。CF 上每次请求要试几次才撞上，实测 **3~11 秒/请求**（流式则是首字延迟）。功能正常，但慢。
 >
-> 验证方法：`curl https://<你的域名>/health` 永远 200（不连上游）；但真实 chat 请求会间歇 401。本仓库代码逻辑（协议转换、流式、鉴权、缓存）本身是正确的，换到单 IP 主机即可正常工作。
+> **想要低延迟 → 用固定出口 IP 的部署**（首次 bootstrap 的 token 当场即可用、可缓存复用，重试循环变成空转）：
+> - 直接用原版 Go `mimo-proxy` 跑在 VPS / 家庭服务器上（它本就为此设计，无此延迟）。
+> - 或让 Cloudflare 只做 DNS+反代，指向跑在固定 IP 主机上的后端。
+>
+> 验证：`curl https://<你的域名>/health` 永远 200（不连上游）；真实 chat 请求在 CF 上会慢但应成功。
 
 ## 功能
 
