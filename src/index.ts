@@ -192,7 +192,7 @@ function handleModels(): Response {
 async function handleOpenAIChat(request: Request, env: Env, signal: AbortSignal): Promise<Response> {
   const bodyBytes = await readBody(request);
   const upstreamBody = ensureOpenAIMarker(bodyBytes);
-  const upstream = await fetchUpstreamWithRetry(env, upstreamBody, signal);
+  const upstream = await fetchUpstream(env, upstreamBody, signal);
   const headers = cloneResponseHeaders(upstream.headers);
   headers.set("Cache-Control", "no-cache");
   applyCors(headers);
@@ -215,7 +215,7 @@ async function handleAnthropicMessages(request: Request, env: Env, signal: Abort
 
   const openAIRequest = anthropicToOpenAI(anthropicRequest);
   const openAIBody = textEncoder.encode(JSON.stringify(openAIRequest));
-  const upstream = await fetchUpstreamWithRetry(env, openAIBody, signal);
+  const upstream = await fetchUpstream(env, openAIBody, signal);
 
   if (anthropicRequest.stream) {
     if (upstream.status >= 400) {
@@ -273,8 +273,8 @@ function buildUpstreamUrl(env: Env, pathname: string): string {
   return `${base}${pathname}`;
 }
 
-async function fetchUpstream(env: Env, body: Uint8Array, signal: AbortSignal, forceRefresh = false): Promise<Response> {
-  const jwt = await getJwt(env, forceRefresh);
+async function fetchUpstream(env: Env, body: Uint8Array, signal: AbortSignal): Promise<Response> {
+  const jwt = await getJwt(env);
   const headers = new Headers({
     "Content-Type": "application/json",
     Authorization: `Bearer ${jwt}`,
@@ -291,37 +291,18 @@ async function fetchUpstream(env: Env, body: Uint8Array, signal: AbortSignal, fo
   });
 }
 
-// fetchUpstreamWithRetry self-heals a stale/expired cached JWT: if upstream
-// rejects with 401 (invalid_token), it drops the cached token, re-bootstraps a
-// fresh one, and retries the request exactly once. It deliberately does NOT
-// retry on 403 (illegal_access) — that signals upstream anti-abuse on the
-// client fingerprint, and re-bootstrapping would only make it worse. The real
-// remedy for 403 is a working shared JWT cache (KV) so bootstraps stay rare.
-async function fetchUpstreamWithRetry(env: Env, body: Uint8Array, signal: AbortSignal): Promise<Response> {
-  const response = await fetchUpstream(env, body, signal);
-  if (response.status !== 401) {
-    return response;
-  }
-  await response.body?.cancel().catch(() => undefined);
-  return fetchUpstream(env, body, signal, true);
-}
-
-async function getJwt(env: Env, forceRefresh = false): Promise<string> {
-  if (forceRefresh) {
-    // Drop any cached JWT (in-memory + KV) so the bootstrap below is forced.
-    jwtCache.delete(JWT_CACHE_KEY);
-    const kv = env.MIMO_JWT_KV;
-    if (kv) await kv.delete(JWT_CACHE_KEY).catch(() => undefined);
-  } else {
-    const cached = await readCachedJwt(env);
-    if (cached) return cached.jwt;
-  }
+// getJwt returns a shared JWT, mirroring the Go server's single-token model:
+// read the cached token (in-memory, then KV), and only bootstrap when it is
+// missing or within JWT_REFRESH_BUFFER_MS of expiry. It never bootstraps in
+// reaction to an upstream 401 — proactive refresh keeps the token valid, and
+// reactive re-bootstrapping would storm upstream anti-abuse.
+async function getJwt(env: Env): Promise<string> {
+  const cached = await readCachedJwt(env);
+  if (cached) return cached.jwt;
 
   // Single-flight: collapse concurrent bootstraps within this isolate into one
-  // upstream call. Without this, a burst of requests hitting a cold isolate
-  // would each bootstrap with the same client fingerprint at once, which trips
-  // upstream anti-abuse (it rejects tokens when one fingerprint bootstraps too
-  // often). Mirrors the Go server's jwtMu mutex.
+  // upstream call. Mirrors the Go server's jwtMu mutex so a burst of requests on
+  // a cold isolate does not fire many bootstraps at once.
   if (!bootstrapInFlight) {
     bootstrapInFlight = (async () => {
       try {
