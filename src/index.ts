@@ -290,12 +290,15 @@ async function fetchUpstream(env: Env, body: Uint8Array, signal: AbortSignal, fo
   });
 }
 
-// fetchUpstreamWithRetry self-heals a stale/invalid cached JWT: if upstream
-// rejects auth (401/403), it drops the cached token, re-bootstraps a fresh one,
-// and retries the request exactly once.
+// fetchUpstreamWithRetry self-heals a stale/expired cached JWT: if upstream
+// rejects with 401 (invalid_token), it drops the cached token, re-bootstraps a
+// fresh one, and retries the request exactly once. It deliberately does NOT
+// retry on 403 (illegal_access) — that signals upstream anti-abuse on the
+// client fingerprint, and re-bootstrapping would only make it worse. The real
+// remedy for 403 is a working shared JWT cache (KV) so bootstraps stay rare.
 async function fetchUpstreamWithRetry(env: Env, body: Uint8Array, signal: AbortSignal): Promise<Response> {
   const response = await fetchUpstream(env, body, signal);
-  if (response.status !== 401 && response.status !== 403) {
+  if (response.status !== 401) {
     return response;
   }
   await response.body?.cancel().catch(() => undefined);
