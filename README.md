@@ -19,7 +19,7 @@ Cloudflare Worker 版本的 mimo-proxy，行为对齐 Go 版 `mimo-proxy`。
 - 默认上游：`https://api.xiaomimimo.com`，可通过 `MIMO_BASE_URL` 覆盖。
 - 自动 bootstrap 到 `/api/free-ai/bootstrap` 获取 JWT。
 - JWT 优先使用 KV binding `MIMO_JWT_KV` 缓存；没有 KV 或写入失败时，会在请求时 bootstrap 后直接使用。
-- 客户端指纹：bootstrap 时携带 `client` 指纹。配置 `MIMO_CLIENT_FINGERPRINT` 则固定使用该值；未配置时每个 isolate 启动随机生成一个并在其生命周期内保持。
+- 客户端指纹：bootstrap 时携带 `client` 指纹。**不建议设置 `MIMO_CLIENT_FINGERPRINT`**——见下方「⚠️ 指纹与防滥用」。未配置时每个 isolate 启动随机生成一个并在其生命周期内保持，这正是 Workers 环境下的推荐做法。
 - 上游请求强制：
   - `model=mimo-auto`
   - `Authorization: Bearer <jwt>`
@@ -54,23 +54,29 @@ wrangler secret put MIMO_API_KEY
 wrangler secret put MIMO_BASE_URL
 ```
 
-4. 推荐：固定客户端指纹（生产环境）：
-
-```bash
-wrangler secret put MIMO_CLIENT_FINGERPRINT
-```
-
-> Worker 是无状态的，isolate 会被频繁创建/销毁。未配置 `MIMO_CLIENT_FINGERPRINT` 时，每个新 isolate 会生成不同的随机指纹，导致 bootstrap 时上报的 `client` 持续漂移、刷新更频繁。生产环境建议显式配置一个稳定值（任意足够随机的字符串即可，例如 `openssl rand -hex 16` 的输出）。
-
 5. 部署：
 
 ```bash
 npm run deploy
 ```
 
+## ⚠️ 指纹与防滥用（重要）
+
+**不要设置 `MIMO_CLIENT_FINGERPRINT`。** 上游按 `client` 指纹做防滥用：同一个指纹被频繁 bootstrap 会被判定为滥用，导致该指纹签发的 token 被作废（返回 `401 invalid_token` / `403 illegal_access`）。
+
+Go 原版是单进程、单指纹、单 token、后台慢刷新，所以从不触发。但 Cloudflare Worker 是**多 isolate**的：如果设了固定指纹，所有 isolate 都用同一个指纹各自 bootstrap，从 Cloudflare 共享出口 IP 看就像一个客户端在刷接口 → 触发防滥用 → 间歇性 401/403。
+
+正确做法：
+
+- **不设 `MIMO_CLIENT_FINGERPRINT`** → 每个 isolate 用自己随机生成、且生命周期内稳定的指纹，彼此独立、互不作废。
+- **让 KV 缓存真正生效**(见第 2 步)→ 各 isolate 共享同一个 token，bootstrap 频率降到最低。
+- 代码侧已有两道保护:同 isolate 内并发 bootstrap 用单飞合并;上游返回 401 时丢弃缓存、刷新并重试一次(403 不重试,以免加剧防滥用)。
+
+排查时若看到间歇性 `Invalid Token`,且 KV namespace 显示「无读写」,基本就是这个问题:先删掉 `MIMO_CLIENT_FINGERPRINT`,再修好 KV 绑定。
+
 ## 通过 GitHub 部署
 
-无论哪种方式，**前置准备都一样**：先按「手动部署」第 2 步建好真实 KV namespace 拿到 id，再用 `wrangler secret put` 设置好 `MIMO_API_KEY` / `MIMO_CLIENT_FINGERPRINT` 等密钥（这些存在 Cloudflare 侧，不进 GitHub）。
+无论哪种方式，**前置准备都一样**：先按「手动部署」第 2 步建好真实 KV namespace 拿到 id，再用 `wrangler secret put` 设置好 `MIMO_API_KEY`（可选鉴权）。**不要设置 `MIMO_CLIENT_FINGERPRINT`**（见「⚠️ 指纹与防滥用」）。
 
 > 🔒 关于 KV id：仓库内的 `wrangler.toml` **始终保留占位符 `00000000000000000000000000000000`**，真实 id 不入库，在部署时注入（下面两种方式各有做法）。
 
