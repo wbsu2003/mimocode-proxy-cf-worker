@@ -45,7 +45,7 @@ id = "你的真实_KV_namespace_id"
 preview_id = "mimo_proxy_jwt_preview"
 ```
 
-> ⚠️ 仓库里的 `id = "00000000000000000000000000000000"` 只是占位符。**部署前必须换成真实 id**，否则 KV 缓存不生效，JWT 无法跨 isolate 持久化——会退化为每个 isolate 各自 bootstrap。功能仍可用，但 bootstrap 调用会明显变频繁。创建 KV namespace：`wrangler kv namespace create MIMO_JWT_KV`。
+> ⚠️ 仓库里的 `id = "00000000000000000000000000000000"` 只是占位符。本地手动部署时需填入真实 id 才能让 KV 缓存生效（否则 JWT 无法跨 isolate 持久化，会退化为每个 isolate 各自 bootstrap，功能仍可用但更频繁）。**为避免把真实 id 误提交，填好后执行 `git update-index --skip-worktree wrangler.toml`**，git 就不再追踪你对该文件的本地改动。创建 KV namespace：`wrangler kv namespace create MIMO_JWT_KV`。
 
 3. 可选：设置 API Key 与上游地址：
 
@@ -70,7 +70,9 @@ npm run deploy
 
 ## 通过 GitHub 部署
 
-无论哪种方式，**前置准备都一样**：先按「手动部署」第 2 步建好真实 KV namespace 并填进 `wrangler.toml`，再用 `wrangler secret put` 设置好 `MIMO_API_KEY` / `MIMO_CLIENT_FINGERPRINT` 等密钥（这些存在 Cloudflare 侧，不进 GitHub）。
+无论哪种方式，**前置准备都一样**：先按「手动部署」第 2 步建好真实 KV namespace 拿到 id，再用 `wrangler secret put` 设置好 `MIMO_API_KEY` / `MIMO_CLIENT_FINGERPRINT` 等密钥（这些存在 Cloudflare 侧，不进 GitHub）。
+
+> 🔒 关于 KV id：仓库内的 `wrangler.toml` **始终保留占位符 `00000000000000000000000000000000`**，真实 id 不入库，在部署时注入（下面两种方式各有做法）。
 
 仓库已内置两个 workflow：
 
@@ -83,20 +85,23 @@ GitHub 侧零密钥，由 Cloudflare 监听仓库：
 
 1. Cloudflare 后台 → **Workers & Pages** → **Create** → **Connect to Git**。
 2. 授权 GitHub，选择本仓库。
-3. 构建配置：Build command `npm ci`，Deploy command `npx wrangler deploy`，分支 `main`。
-4. 保存。之后每次 `git push` 到 `main`，Cloudflare 自动构建并部署。
+3. 在构建设置里加一个构建环境变量 `MIMO_JWT_KV_ID` = 真实 KV id。
+4. 构建配置：Build command `npm ci`，Deploy command
+   `sed -i "s/00000000000000000000000000000000/$MIMO_JWT_KV_ID/" wrangler.toml && npx wrangler deploy`，分支 `main`。
+5. 保存。之后每次 `git push` 到 `main`，Cloudflare 自动构建并部署。
 
 > 用方式一时不需要 `deploy.yml`，建议删除它（只保留 `ci.yml`），避免与 Cloudflare 的自动部署重复触发。
 
 ### 方式二：GitHub Actions 主动部署（使用内置 `deploy.yml`）
 
-部署前可先跑类型检查作为门禁，控制权在 GitHub 侧。需配置两个仓库 secret：
+部署前可先跑类型检查作为门禁，控制权在 GitHub 侧。`deploy.yml` 会在部署前用 `sed` 把占位符替换成真实 KV id（只在 runner 内存发生，不写回仓库）。需配置三个仓库 secret：
 
 1. **创建 API Token**：Cloudflare 后台 → My Profile → API Tokens → Create Token → 套用 **"Edit Cloudflare Workers"** 模板。
 2. **获取 Account ID**：Workers & Pages 页面右侧栏。
 3. GitHub repo → **Settings → Secrets and variables → Actions** 添加：
    - `CLOUDFLARE_API_TOKEN`
    - `CLOUDFLARE_ACCOUNT_ID`
+   - `MIMO_JWT_KV_ID`（真实 KV namespace id）
 
 配好后 push 到 `main` 即触发部署，也可在 Actions 页面手动 **Run workflow**。
 
@@ -104,7 +109,7 @@ GitHub 侧零密钥，由 Cloudflare 监听仓库：
 
 | | 方式一 Workers Builds | 方式二 GitHub Actions |
 |---|---|---|
-| GitHub 配 secret | 不需要 | 需要 2 个 |
+| GitHub 配 secret | 不需要 | 需要 3 个 |
 | 部署前自定义 CI | 受限 | 完全自由 |
 | 触发 | push 自动 | push 自动 + 手动 |
 | 维护成本 | 最低 | 中 |

@@ -6,7 +6,10 @@ workers_dev = true
 [vars]
 MIMO_BASE_URL = "https://api.xiaomimimo.com"
 
-# JWT 缓存可选：本地开发使用 preview_id；生产部署前请把 id 替换为真实 KV namespace id。
+# JWT 缓存可选。下面的 id 是占位符，故意保留全 0 不入库。
+# 真实 KV namespace id 在部署时注入，不提交到仓库：
+#   - GitHub Actions：由 deploy.yml 用 secret MIMO_JWT_KV_ID 替换（见该文件）
+#   - 本地部署：填入真实 id 后执行 `git update-index --skip-worktree wrangler.toml` 避免误提交
 [[kv_namespaces]]
 binding = "MIMO_JWT_KV"
 id = "00000000000000000000000000000000"

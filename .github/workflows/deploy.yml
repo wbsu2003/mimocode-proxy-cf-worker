@@ -4,6 +4,7 @@ name: Deploy
 # 需要在 GitHub 仓库 Settings -> Secrets and variables -> Actions 配置：
 #   - CLOUDFLARE_API_TOKEN  （Cloudflare 后台创建，需 "Edit Cloudflare Workers" 权限）
 #   - CLOUDFLARE_ACCOUNT_ID （Cloudflare 后台右侧栏的 Account ID）
+#   - MIMO_JWT_KV_ID        （真实 KV namespace id；部署时注入，仓库内仍保持占位符）
 on:
   push:
     branches: [main]
@@ -20,6 +21,11 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npm run typecheck
+      # 把 wrangler.toml 里的占位符替换成真实 KV id（只发生在 runner 内存，不会写回仓库）。
+      - name: Inject KV namespace id
+        env:
+          KV_ID: ${{ secrets.MIMO_JWT_KV_ID }}
+        run: sed -i "s/00000000000000000000000000000000/${KV_ID}/" wrangler.toml
       - uses: cloudflare/wrangler-action@v3
         with:
           apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
