@@ -170,22 +170,6 @@ export default {
 
     try {
       switch (path) {
-        case "/debug/timing": {
-          // 临时诊断：分别测 Worker→上游的 bootstrap 往返、单次 chat 往返耗时，定位延迟来源。测完即删。
-          const colo = (request as unknown as { cf?: { colo?: string } }).cf?.colo ?? "unknown";
-          const probeBody = textEncoder.encode(JSON.stringify({
-            model: SUPPORTED_MODEL,
-            messages: [{ role: "system", content: ANTI_ABUSE_MARKER }, { role: "user", content: "hi" }],
-            max_tokens: 4,
-          }));
-          const t0 = Date.now();
-          const entry = await bootstrapJwt(env);
-          const t1 = Date.now();
-          const r = await fetchUpstreamWithToken(env, probeBody, request.signal, entry.jwt);
-          await r.body?.cancel().catch(() => undefined);
-          const t2 = Date.now();
-          return jsonResponse({ colo, bootstrapMs: t1 - t0, chatMs: t2 - t1, chatStatus: r.status });
-        }
         case "/v1/models":
         case "/models":
           if (request.method !== "GET") return methodNotAllowed(["GET"]);
@@ -454,14 +438,14 @@ async function raceChat(env: Env, body: Uint8Array, signal: AbortSignal, token: 
   }
 
   const winnerIndex = winner ? responses.indexOf(winner) : -1;
-  // abort 除赢家外仍在飞的子请求；赢家的 controller 不动，其 body 要回给客户端（含流式）。
+  // 同步 abort 除赢家外仍在飞的子请求（abort() 是同步的，不阻塞）。
+  // 关键：不要 await 任何东西——选出赢家后立刻返回，否则会退化成"等最慢的并发完成"。
   controllers.forEach((controller, i) => {
     if (i !== winnerIndex) controller.abort();
   });
-  // 等全部尝试落定，确保 responses[] 填齐，再 cancel 非赢家已到达的 body。
-  await Promise.allSettled(attempts);
+  // 对已到达的非赢家响应 cancel body（fire-and-forget，不 await），回收连接、避免泄漏。
   for (let i = 0; i < responses.length; i += 1) {
-    if (i !== winnerIndex) await responses[i]?.body?.cancel().catch(() => undefined);
+    if (i !== winnerIndex) responses[i]?.body?.cancel().catch(() => undefined);
   }
 
   if (winner) return winner;
