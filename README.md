@@ -2,6 +2,10 @@
 
 Cloudflare Worker 版本的 mimo-proxy，行为对齐 Go 版 `mimo-proxy`。
 
+> 原版（Go 实现）：https://github.com/myflavor/mimo-proxy
+>
+> 相关文章（介绍 / 部署教程）：https://laosu.tech/2026/06/18/MiMoCode%E5%85%8D%E8%B4%B9API%E5%8F%8D%E5%90%91%E4%BB%A3%E7%90%86mimo-proxy/
+
 > ## ⚠️ 重要：上游 token 绑定来源 IP（CF 上可用但有延迟代价）
 >
 > 经实测确认：**上游 `api.xiaomimimo.com` 会把 bootstrap 返回的 JWT 绑定到 bootstrap 请求的来源 IP**——该 token 只能从签发它的那个 IP 发起 chat，换 IP 即 `401 invalid_token`。
@@ -13,7 +17,8 @@ Cloudflare Worker 版本的 mimo-proxy，行为对齐 Go 版 `mimo-proxy`。
 > **代价：延迟**。CF 上每次请求要试几次才撞上，实测 **3~11 秒/请求**（流式则是首字延迟）。功能正常，但慢。
 >
 > **想要低延迟 → 用固定出口 IP 的部署**（首次 bootstrap 的 token 当场即可用、可缓存复用，重试循环变成空转）：
-> - 直接用原版 Go `mimo-proxy` 跑在 VPS / 家庭服务器上（它本就为此设计，无此延迟）。
+> - 直接用原版 Go `mimo-proxy`（https://github.com/myflavor/mimo-proxy）跑在 VPS / 家庭服务器 / NAS 上（它本就为此设计，无此延迟）。
+> - **Docker 部署推荐**：`wbsu2003/mimo-proxy`（https://hub.docker.com/r/wbsu2003/mimo-proxy）。
 > - 或让 Cloudflare 只做 DNS+反代，指向跑在固定 IP 主机上的后端。
 >
 > 验证：`curl https://<你的域名>/health` 永远 200（不连上游）；真实 chat 请求在 CF 上会慢但应成功。
