@@ -32,6 +32,13 @@
  *      （随机指纹照常工作）。同一 IP 快速连做多次 bootstrap+chat 全部成功 →
  *      无频率限制。因此 *无需也不建议设置 MIMO_CLIENT_FINGERPRINT*，随机即可。
  *
+ * 【关于绑定的进一步实测（别再试这些"零成本根治"）】
+ *   - `x-session-affinity` 一致性 *不能* 越过 IP 绑定。实验：Worker(CF IP) 用固定
+ *     affinity bootstrap 出 token，再从另一 IP 用 *相同* affinity 去 chat → 仍 401。
+ *     所以让 bootstrap/chat 复用同一个 affinity 值没用。
+ *   - 绑定粒度是 *精确到源 IP*，不是 AS / 网段级（否则 CF 同 AS 出口命中率应接近
+ *     100%，而实测仅约 40%，恰好是"单机房小出口池 2~3 个 IP 随机撞"的概率）。
+ *
  * 【排查方法论】`/health` 不连上游、永远 200，用来测连通；要区分"代理 bug"还是
  *   "上游行为"，就直连上游、用与代理 *逐字节一致* 的请求（含 marker 与全部头）复刻；
  *   错误体是上游格式(`invalid_token`/`illegal_access`)还是代理格式
@@ -147,19 +154,6 @@ export default {
 
     try {
       switch (path) {
-        case "/debug/jwt": {
-          // 临时诊断：用调用方指定的 x-session-affinity 在 Worker(CF 出口 IP) 上 bootstrap
-          // 一个 token 并回传，用于"affinity 相同、IP 不同"的跨 IP 实验。测完即删。
-          const aff = url.searchParams.get("aff") || `ses_${randomHex(12)}`;
-          const r = await fetch(buildUpstreamUrl(env, BOOTSTRAP_PATH), {
-            method: "POST",
-            headers: { "Content-Type": "application/json", "User-Agent": USER_AGENT, "x-session-affinity": aff },
-            body: JSON.stringify({ client: getFingerprint(env) }),
-          });
-          const j = (await r.json()) as { jwt?: string };
-          const colo = (request as unknown as { cf?: { colo?: string } }).cf?.colo ?? "unknown";
-          return jsonResponse({ jwt: j.jwt, aff, colo, bootstrapStatus: r.status });
-        }
         case "/v1/models":
         case "/models":
           if (request.method !== "GET") return methodNotAllowed(["GET"]);
