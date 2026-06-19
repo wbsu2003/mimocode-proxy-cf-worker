@@ -170,6 +170,22 @@ export default {
 
     try {
       switch (path) {
+        case "/debug/timing": {
+          // 临时诊断：分别测 Worker→上游的 bootstrap 往返、单次 chat 往返耗时，定位延迟来源。测完即删。
+          const colo = (request as unknown as { cf?: { colo?: string } }).cf?.colo ?? "unknown";
+          const probeBody = textEncoder.encode(JSON.stringify({
+            model: SUPPORTED_MODEL,
+            messages: [{ role: "system", content: ANTI_ABUSE_MARKER }, { role: "user", content: "hi" }],
+            max_tokens: 4,
+          }));
+          const t0 = Date.now();
+          const entry = await bootstrapJwt(env);
+          const t1 = Date.now();
+          const r = await fetchUpstreamWithToken(env, probeBody, request.signal, entry.jwt);
+          await r.body?.cancel().catch(() => undefined);
+          const t2 = Date.now();
+          return jsonResponse({ colo, bootstrapMs: t1 - t0, chatMs: t2 - t1, chatStatus: r.status });
+        }
         case "/v1/models":
         case "/models":
           if (request.method !== "GET") return methodNotAllowed(["GET"]);
