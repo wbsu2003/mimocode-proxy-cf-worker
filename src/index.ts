@@ -147,6 +147,19 @@ export default {
 
     try {
       switch (path) {
+        case "/debug/jwt": {
+          // 临时诊断：用调用方指定的 x-session-affinity 在 Worker(CF 出口 IP) 上 bootstrap
+          // 一个 token 并回传，用于"affinity 相同、IP 不同"的跨 IP 实验。测完即删。
+          const aff = url.searchParams.get("aff") || `ses_${randomHex(12)}`;
+          const r = await fetch(buildUpstreamUrl(env, BOOTSTRAP_PATH), {
+            method: "POST",
+            headers: { "Content-Type": "application/json", "User-Agent": USER_AGENT, "x-session-affinity": aff },
+            body: JSON.stringify({ client: getFingerprint(env) }),
+          });
+          const j = (await r.json()) as { jwt?: string };
+          const colo = (request as unknown as { cf?: { colo?: string } }).cf?.colo ?? "unknown";
+          return jsonResponse({ jwt: j.jwt, aff, colo, bootstrapStatus: r.status });
+        }
         case "/v1/models":
         case "/models":
           if (request.method !== "GET") return methodNotAllowed(["GET"]);
