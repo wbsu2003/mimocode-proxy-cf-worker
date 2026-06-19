@@ -12,16 +12,20 @@ Cloudflare Worker 版本的 mimo-proxy，行为对齐 Go 版 `mimo-proxy`。
 >
 > Cloudflare Workers **没有固定出口 IP**：bootstrap 与 chat 是两个独立 `fetch`，会从不同的 CF 出口 IP（甚至不同数据中心）发出。所以"缓存一个 token 复用"在 CF 上几乎必然失败（chat 的 IP 对不上 bootstrap 的 IP）。
 >
-> **本代理的应对**：由于实测上游**没有 bootstrap 频率限制**，代码用「重试直到 IP 撞上」绕过——一次请求里若 chat 返回 401，就重新 bootstrap 一个新 token 再试，最多 `MAX_AUTH_RETRIES`(默认 10) 次。单次撞中率约 40%，10 次后成功率 ≈ 99%。**实测 CF 上 8/8 成功。**
+> **本代理的应对（并发抢答）**：由于实测上游**没有 bootstrap 频率限制**、且**同一次调用里并发子请求的出口 IP 相互独立**，代码这样绕过：
+> 1. **先单发**一次（用缓存/共享 token）——固定 IP 必中、CF 上约 40% 直接命中、缓存命中都走这条廉价路径，零额外开销；
+> 2. 若 `401`，再**并发抢答**：一轮用一个全新 token 并发发 K 个 chat（`MIMO_CONCURRENT_CHAT`，默认 5），取首个成功、abort 其余；一轮命中率 ≈ `1 − 0.6^K`（K=5 ≈ 92%），最多 `MIMO_MAX_CONCURRENT_ROUNDS`（默认 2）轮 → ≈ 99%。
 >
-> **代价：延迟**。CF 上每次请求要试几次才撞上，实测 **3~11 秒/请求**（流式则是首字延迟）。功能正常，但慢。
+> **代价**：CF miss 时一次性并发 K 个 chat（约 0.4K 个会真正命中并启动推理，多余的被 abort，可能浪费少量上游算力）。换来的是延迟接近"一次 chat"，而非串行重试的累加。
 >
-> **想要低延迟 → 用固定出口 IP 的部署**（首次 bootstrap 的 token 当场即可用、可缓存复用，重试循环变成空转）：
-> - 直接用原版 Go `mimo-proxy`（https://github.com/myflavor/mimo-proxy）跑在 VPS / 家庭服务器 / NAS 上（它本就为此设计，无此延迟）。
+> **想要零代价 → 用固定出口 IP 的部署**（单发那一步必中，并发分支根本不触发；可开 `MIMO_USE_KV_CACHE=true` 复用 token）：
+> - 直接用原版 Go `mimo-proxy`（https://github.com/myflavor/mimo-proxy）跑在 VPS / 家庭服务器 / NAS 上（它本就为此设计）。
 > - **Docker 部署推荐**：`wbsu2003/mimo-proxy`（https://hub.docker.com/r/wbsu2003/mimo-proxy）。
 > - 或让 Cloudflare 只做 DNS+反代，指向跑在固定 IP 主机上的后端。
 >
-> 验证：`curl https://<你的域名>/health` 永远 200（不连上游）；真实 chat 请求在 CF 上会慢但应成功。
+> 相关可调 env：`MIMO_CONCURRENT_CHAT`（默认 5）、`MIMO_MAX_CONCURRENT_ROUNDS`（默认 2）、`MIMO_USE_KV_CACHE`（默认关；仅固定 IP 主机建议开）。
+>
+> 验证：`curl https://<你的域名>/health` 永远 200（不连上游）；真实 chat 请求在 CF 上应成功。
 
 ## 功能
 

@@ -18,11 +18,14 @@
  *     - 单机单 IP 部署（Go 版 / VPS / NAS）天然没这个问题，首个 token 当场可用、
  *       可缓存复用。
  *
- * 【解法】见 `fetchUpstreamResilient`：先用（可能缓存的）共享 token 试一次；
- *   若 401，就重新 bootstrap 一个全新 token 再试，最多 MAX_AUTH_RETRIES 次，
- *   直到某次 bootstrap 与 chat 的出口 IP 恰好一致。单次撞中率约 40%，10 次 ≈ 99%。
- *   之所以敢这样"暴力重试"，是因为实测上游 *没有 bootstrap 频率限制*（见下）。
- *   代价：CF 上每请求要试几次，延迟约 3~11s。固定 IP 主机上第一次就中，循环空转。
+ * 【解法】见 `fetchUpstreamConcurrent`：先用（可能缓存的）token 单发一次（覆盖固定 IP
+ *   必中、CF 上约 40% 的幸运命中，零浪费）；若 401，再进入“并发抢答”——一轮里用同一个
+ *   全新 token 并发发 K 个 chat（K=MIMO_CONCURRENT_CHAT，默认 5），取首个非 401 的响应、
+ *   abort 其余。每个并发 chat 的出口 IP 相互独立（已实测：同批并发里 200/401 混合出现），
+ *   所以一轮命中率 ≈ 1 − 0.6^K（K=5 ≈ 92%），最多 MIMO_MAX_CONCURRENT_ROUNDS 轮（默认 2）。
+ *   之所以敢这样并发，是因为实测上游 *没有 bootstrap 频率限制*（见下）。
+ *   代价：CF miss 时一次性发 K 个 chat（约 0.4K 个会真正命中并启动推理，多余的被 abort）。
+ *   固定出口 IP 主机上：单发那一步就命中，并发分支根本不会触发（零额外开销）。
  *
  * 【两个被证伪的假设（曾据此走过弯路，勿重蹈）】
  *   1. `403 Illegal access` 不是"封 IP/防滥用"，而是 *请求缺少 anti-abuse 系统
@@ -38,6 +41,8 @@
  *     所以让 bootstrap/chat 复用同一个 affinity 值没用。
  *   - 绑定粒度是 *精确到源 IP*，不是 AS / 网段级（否则 CF 同 AS 出口命中率应接近
  *     100%，而实测仅约 40%，恰好是"单机房小出口池 2~3 个 IP 随机撞"的概率）。
+ *   - 同一次 Worker 调用里发出的 *并发* 子请求，出口 IP 相互 *独立*（不会塌缩到一条
+ *     连接/一个 IP），这正是“并发抢答”能提速的前提（已用 /debug/race 实测确认）。
  *
  * 【排查方法论】`/health` 不连上游、永远 200，用来测连通；要区分"代理 bug"还是
  *   "上游行为"，就直连上游、用与代理 *逐字节一致* 的请求（含 marker 与全部头）复刻；
@@ -59,6 +64,16 @@ interface Env {
    * 未设置时每个 isolate 启动随机生成一个并在其生命周期内保持。
    */
   MIMO_CLIENT_FINGERPRINT?: string;
+  /** 并发抢答时每轮并发的 chat 数（默认 5）。见文件头的 IP 绑定说明。 */
+  MIMO_CONCURRENT_CHAT?: string;
+  /** 单发失败后，并发抢答的最大轮数（默认 2）。 */
+  MIMO_MAX_CONCURRENT_ROUNDS?: string;
+  /**
+   * 是否启用 KV 跨实例缓存 JWT。默认关闭（""/未设）。
+   * 注意：上游 token 绑定来源 IP，跨机房共享一个 token 在 CF 上是帮倒忙
+   * （详见文件头）。仅在“固定出口 IP 主机”上才建议设为 "true"。
+   */
+  MIMO_USE_KV_CACHE?: string;
 }
 
 interface JwtEntry {
@@ -123,10 +138,11 @@ const MAX_BODY_BYTES = 32 * 1024 * 1024;
 const JWT_CACHE_KEY = "mimo-jwt";
 const JWT_REFRESH_BUFFER_MS = 5 * 60 * 1000;
 const JWT_CACHE_TTL_SECONDS = 60 * 60;
-// 上游把 JWT 绑定到 bootstrap 的出口 IP。在出口 IP 不固定的宿主上（Cloudflare），
-// 靠反复重新 bootstrap，直到 bootstrap 与 chat 的出口 IP 撞上来重试。
-// 实测单次撞中率约 40% → 1 - 0.6^10 ≈ 99.4%。
-const MAX_AUTH_RETRIES = 10;
+// 并发抢答的默认参数（可被 env 覆盖）。上游把 JWT 绑定到 bootstrap 的出口 IP，
+// CF 出口 IP 不固定且并发子请求出口 IP 相互独立，故一轮 K 并发命中率 ≈ 1 − 0.6^K。
+const DEFAULT_CONCURRENT_CHAT = 5;
+const DEFAULT_MAX_CONCURRENT_ROUNDS = 2;
+const MAX_CONCURRENT_CHAT = 20;
 
 const textEncoder = new TextEncoder();
 const textDecoder = new TextDecoder();
@@ -249,7 +265,7 @@ function handleModels(): Response {
 async function handleOpenAIChat(request: Request, env: Env, signal: AbortSignal): Promise<Response> {
   const bodyBytes = await readBody(request);
   const upstreamBody = ensureOpenAIMarker(bodyBytes);
-  const upstream = await fetchUpstreamResilient(env, upstreamBody, signal);
+  const upstream = await fetchUpstreamConcurrent(env, upstreamBody, signal);
   const headers = cloneResponseHeaders(upstream.headers);
   headers.set("Cache-Control", "no-cache");
   applyCors(headers);
@@ -272,7 +288,7 @@ async function handleAnthropicMessages(request: Request, env: Env, signal: Abort
 
   const openAIRequest = anthropicToOpenAI(anthropicRequest);
   const openAIBody = textEncoder.encode(JSON.stringify(openAIRequest));
-  const upstream = await fetchUpstreamResilient(env, openAIBody, signal);
+  const upstream = await fetchUpstreamConcurrent(env, openAIBody, signal);
 
   if (anthropicRequest.stream) {
     if (upstream.status >= 400) {
@@ -330,14 +346,16 @@ function buildUpstreamUrl(env: Env, pathname: string): string {
   return `${base}${pathname}`;
 }
 
-async function fetchUpstream(env: Env, body: Uint8Array, signal: AbortSignal, fresh = false): Promise<Response> {
-  // fresh=true 时绕过所有缓存、bootstrap 一个全新 token。供 IP 重试循环使用：
-  // 上游把 token 绑定到 bootstrap 的出口 IP，而 Cloudflare 上 bootstrap 与 chat 这两个
-  // fetch 的出口 IP 各不相同，所以每个全新 token 都给"两个 IP 撞上"多一次独立机会。
-  const jwt = fresh ? (await bootstrapJwt(env)).jwt : await getJwt(env);
+// fetchUpstreamWithToken：用 *指定* token 发一次 chat（供并发抢答里 K 个并发共享一个 token）。
+async function fetchUpstreamWithToken(
+  env: Env,
+  body: Uint8Array,
+  signal: AbortSignal,
+  token: string,
+): Promise<Response> {
   const headers = new Headers({
     "Content-Type": "application/json",
-    Authorization: `Bearer ${jwt}`,
+    Authorization: `Bearer ${token}`,
     "X-Mimo-Source": MIMO_SOURCE,
     "x-session-affinity": `ses_${randomHex(12)}`,
     "User-Agent": USER_AGENT,
@@ -351,24 +369,95 @@ async function fetchUpstream(env: Env, body: Uint8Array, signal: AbortSignal, fr
   });
 }
 
-// fetchUpstreamResilient 用于在出口 IP 不固定的宿主（Cloudflare）上绕过上游"token 绑定
-// IP"的限制。先用共享/缓存的 token 试一次（在固定 IP 宿主上这是最优：只 bootstrap 一次、
-// 反复复用）。若上游返回 401（token 的 bootstrap IP ≠ 本次请求 chat 的出口 IP），就重新
-// bootstrap 一个全新 token 重试，最多 MAX_AUTH_RETRIES 次。之所以安全，是因为实测上游
-// 没有 bootstrap 频率限制。
-async function fetchUpstreamResilient(env: Env, body: Uint8Array, signal: AbortSignal): Promise<Response> {
-  let response = await fetchUpstream(env, body, signal);
-  for (let attempt = 0; attempt < MAX_AUTH_RETRIES && response.status === 401; attempt += 1) {
-    await response.body?.cancel().catch(() => undefined);
-    response = await fetchUpstream(env, body, signal, true);
-  }
-  return response;
+// 单发：用缓存/共享 token（getJwt）发一次。固定出口 IP 主机或缓存命中时，这一发即成。
+async function fetchUpstream(env: Env, body: Uint8Array, signal: AbortSignal): Promise<Response> {
+  return fetchUpstreamWithToken(env, body, signal, await getJwt(env));
 }
 
-// getJwt 返回共享/缓存的 JWT（先内存，后 KV），仅在缺失时才 bootstrap。这是"顺利路径"的
-// token，在固定 IP 宿主上最优（一次 bootstrap 反复复用）。这里刻意不做"401 时反应式重新
-// bootstrap"——那是 `fetchUpstreamResilient` 的职责（它绕过本缓存、每次重试都铸造全新
-// token 去撞 IP；详见文件头）。
+function concurrentChatCount(env: Env): number {
+  const n = Number(env.MIMO_CONCURRENT_CHAT);
+  if (!Number.isFinite(n) || n < 1) return DEFAULT_CONCURRENT_CHAT;
+  return Math.min(MAX_CONCURRENT_CHAT, Math.floor(n));
+}
+
+function maxConcurrentRounds(env: Env): number {
+  const n = Number(env.MIMO_MAX_CONCURRENT_ROUNDS);
+  if (!Number.isFinite(n) || n < 1) return DEFAULT_MAX_CONCURRENT_ROUNDS;
+  return Math.floor(n);
+}
+
+// fetchUpstreamConcurrent：本代理对外的统一入口，见文件头【解法】。
+// 阶段一：用缓存/共享 token 单发一次——覆盖固定 IP 必中、CF 上约 40% 的幸运命中、缓存命中，
+//         零额外开销（固定出口 IP 主机上永远走这条，不触发并发）。
+// 阶段二：单发若 401（CF 上 token 的 bootstrap IP 对不上本次 chat 出口 IP），进入并发抢答：
+//         每轮用一个全新 token 并发发 K 个 chat，取首个非 401、abort 其余；最多 rounds 轮。
+async function fetchUpstreamConcurrent(env: Env, body: Uint8Array, signal: AbortSignal): Promise<Response> {
+  const first = await fetchUpstream(env, body, signal);
+  if (first.status !== 401) return first;
+  await first.body?.cancel().catch(() => undefined);
+
+  const k = concurrentChatCount(env);
+  const rounds = maxConcurrentRounds(env);
+  let last = first;
+  for (let round = 0; round < rounds; round += 1) {
+    const token = (await bootstrapJwt(env)).jwt;
+    const winner = await raceChat(env, body, signal, token, k);
+    if (winner.status !== 401) return winner;
+    await winner.body?.cancel().catch(() => undefined);
+    last = winner;
+  }
+  return last;
+}
+
+// raceChat：用同一个 token 并发发 k 个 chat，返回首个非 401 响应，并 abort 其余 + cancel 其 body。
+// 之所以并发能提速：同一次调用里的并发子请求出口 IP 相互独立（已实测），各自约 40% 命中，
+// 一轮命中率 ≈ 1 − 0.6^k。全部 401 → 返回一个合成的 401（其余 body 已全部清理，避免泄漏）。
+async function raceChat(env: Env, body: Uint8Array, signal: AbortSignal, token: string, k: number): Promise<Response> {
+  const controllers = Array.from({ length: k }, () => new AbortController());
+  const responses: Array<Response | undefined> = new Array(k);
+
+  // 客户端断开 → abort 全部子请求（赢家选出后仍保留此监听，以便流式途中客户端断开能取消上游）。
+  const onClientAbort = () => controllers.forEach((c) => c.abort());
+  if (signal.aborted) onClientAbort();
+  else signal.addEventListener("abort", onClientAbort, { once: true });
+
+  // 每个尝试：状态 <400 则 resolve(Response)，否则 reject（让 Promise.any 跳过 401）。
+  const attempts = controllers.map((ctrl, i) =>
+    fetchUpstreamWithToken(env, body, ctrl.signal, token).then((resp) => {
+      responses[i] = resp;
+      if (resp.status >= 200 && resp.status < 400) return resp;
+      throw new Error(`upstream ${resp.status}`);
+    }),
+  );
+
+  let winner: Response | null = null;
+  try {
+    winner = await Promise.any(attempts);
+  } catch {
+    winner = null; // 全部 reject（全 401 或网络错误）
+  }
+
+  const winnerIndex = winner ? responses.indexOf(winner) : -1;
+  // abort 除赢家外仍在飞的子请求；赢家的 controller 不动，其 body 要回给客户端（含流式）。
+  controllers.forEach((controller, i) => {
+    if (i !== winnerIndex) controller.abort();
+  });
+  // 等全部尝试落定，确保 responses[] 填齐，再 cancel 非赢家已到达的 body。
+  await Promise.allSettled(attempts);
+  for (let i = 0; i < responses.length; i += 1) {
+    if (i !== winnerIndex) await responses[i]?.body?.cancel().catch(() => undefined);
+  }
+
+  if (winner) return winner;
+  return new Response(JSON.stringify({ error: { message: "Invalid Token", type: "invalid_token" } }), {
+    status: 401,
+    headers: { "Content-Type": "application/json" },
+  });
+}
+
+// getJwt 返回共享/缓存的 JWT（先内存，KV 默认关、见 MIMO_USE_KV_CACHE），仅在缺失时才
+// bootstrap。这是单发阶段用的 token；并发抢答阶段不走这里，而是每轮 bootstrap 全新 token
+// 去并发撞 IP（详见 fetchUpstreamConcurrent 与文件头）。
 async function getJwt(env: Env): Promise<string> {
   const cached = await readCachedJwt(env);
   if (cached) return cached.jwt;
@@ -395,6 +484,9 @@ async function readCachedJwt(env: Env): Promise<JwtEntry | null> {
   const inMemory = jwtCache.get(JWT_CACHE_KEY);
   if (inMemory && isJwtFresh(inMemory)) return inMemory;
 
+  // KV 默认关：跨机房共享一个 token 在 CF 上会帮倒忙（token 绑定来源 IP，见文件头）。
+  // 仅固定出口 IP 主机才建议开（MIMO_USE_KV_CACHE="true"）。
+  if (env.MIMO_USE_KV_CACHE !== "true") return null;
   const kv = env.MIMO_JWT_KV;
   if (!kv) return null;
 
@@ -412,6 +504,7 @@ async function readCachedJwt(env: Env): Promise<JwtEntry | null> {
 }
 
 async function writeCachedJwt(env: Env, entry: JwtEntry): Promise<void> {
+  if (env.MIMO_USE_KV_CACHE !== "true") return;
   const kv = env.MIMO_JWT_KV;
   if (!kv) return;
   await kv.put(JWT_CACHE_KEY, JSON.stringify(entry), { expirationTtl: JWT_CACHE_TTL_SECONDS });
