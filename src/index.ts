@@ -154,6 +154,44 @@ export default {
 
     try {
       switch (path) {
+        case "/debug/race": {
+          // 临时诊断：用一个 token 并发发 K 个 chat，统计多少个命中 bootstrap 的 IP。
+          // 用于判断并发请求的出口 IP 是否相互独立（决定"并发抢答"方案是否可行）。测完即删。
+          const k = Math.min(20, Math.max(1, Number(url.searchParams.get("k") ?? "6")));
+          const entry = await bootstrapJwt(env);
+          const colo = (request as unknown as { cf?: { colo?: string } }).cf?.colo ?? "unknown";
+          const chatBody = JSON.stringify({
+            model: SUPPORTED_MODEL,
+            messages: [
+              { role: "system", content: ANTI_ABUSE_MARKER },
+              { role: "user", content: "hi" },
+            ],
+            max_tokens: 4,
+          });
+          const statuses = await Promise.all(
+            Array.from({ length: k }, async () => {
+              try {
+                const r = await fetch(buildUpstreamUrl(env, CHAT_PATH), {
+                  method: "POST",
+                  headers: {
+                    "Content-Type": "application/json",
+                    Authorization: `Bearer ${entry.jwt}`,
+                    "X-Mimo-Source": MIMO_SOURCE,
+                    "x-session-affinity": `ses_${randomHex(12)}`,
+                    "User-Agent": USER_AGENT,
+                  },
+                  body: chatBody,
+                });
+                await r.body?.cancel().catch(() => undefined);
+                return r.status;
+              } catch {
+                return -1;
+              }
+            }),
+          );
+          const successCount = statuses.filter((s) => s >= 200 && s < 400).length;
+          return jsonResponse({ colo, k, successCount, statuses });
+        }
         case "/v1/models":
         case "/models":
           if (request.method !== "GET") return methodNotAllowed(["GET"]);
