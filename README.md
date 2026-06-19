@@ -16,7 +16,7 @@ Cloudflare Worker 版本的 mimo-proxy，行为对齐 Go 版 `mimo-proxy`。
 > 1. **先单发**一次（用缓存/共享 token）——固定 IP 必中、CF 上约 40% 直接命中、缓存命中都走这条廉价路径，零额外开销；
 > 2. 若 `401`，再**并发抢答**：一轮用一个全新 token 并发发 K 个 chat（`MIMO_CONCURRENT_CHAT`，默认 5），取首个成功、abort 其余；一轮命中率 ≈ `1 − 0.6^K`（K=5 ≈ 92%），最多 `MIMO_MAX_CONCURRENT_ROUNDS`（默认 2）轮 → ≈ 99%。
 >
-> **代价**：CF miss 时一次性并发 K 个 chat（约 0.4K 个会真正命中并启动推理，多余的被 abort，可能浪费少量上游算力）。换来的是延迟接近"一次 chat"，而非串行重试的累加。
+> **代价**：CF miss 时一次性并发 K 个 chat（约 0.4K 个会真正命中并启动推理，多余的被 abort，可能浪费少量上游算力）。换来的是延迟接近"一次 chat"——**实测 CF(东京 NRT 机房)上约 1.3~2.8 秒/请求**（单段 CF→上游往返 ~0.3s + 模型推理 ~1s）。
 >
 > **想要零代价 → 用固定出口 IP 的部署**（单发那一步必中，并发分支根本不触发；可开 `MIMO_USE_KV_CACHE=true` 复用 token）：
 > - 直接用原版 Go `mimo-proxy`（https://github.com/myflavor/mimo-proxy）跑在 VPS / 家庭服务器 / NAS 上（它本就为此设计）。
