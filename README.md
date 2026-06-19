@@ -4,7 +4,7 @@ Cloudflare Worker 版本的 mimo-proxy，行为对齐 Go 版 `mimo-proxy`。
 
 > 原版（Go 实现）：https://github.com/myflavor/mimo-proxy
 >
-> 相关文章（介绍 / 部署教程）：https://laosu.tech/2026/06/18/MiMoCode%E5%85%8D%E8%B4%B9API%E5%8F%8D%E5%90%91%E4%BB%A3%E7%90%86mimo-proxy/
+> 相关文章（介绍 / 部署教程）：https://laosu.tech/2026/06/18/MiMoCode免费API反向代理mimo-proxy
 
 > ## ⚠️ 重要：上游 token 绑定来源 IP（CF 上可用但有延迟代价）
 >
